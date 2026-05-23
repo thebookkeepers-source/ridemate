@@ -1,0 +1,19 @@
+{
+  "name": "RideMate",
+  "short_name": "RideMate",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#0B1C2E",
+  "theme_color": "#0B1C2E",
+  "description": "RideMate carpool app for drivers and passengers.",
+  "icons": [
+    {
+      "src": "/icons/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}
