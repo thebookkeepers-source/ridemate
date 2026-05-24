@@ -1,0 +1,42 @@
+/* RideMate UI/UX fixes layered on top of existing design */
+html, body, #app { min-height: 100%; }
+.mobileShell, .shell { overflow: visible !important; }
+.appContent { padding-bottom: 150px !important; }
+.appTabs { z-index: 200 !important; }
+.modalBack {
+  position: fixed !important;
+  inset: 0 !important;
+  display: flex !important;
+  align-items: flex-end !important;
+  justify-content: center !important;
+  overflow-y: auto !important;
+  padding-top: calc(env(safe-area-inset-top, 0px) + 56px) !important;
+  background: rgba(6,23,39,.55) !important;
+  z-index: 300 !important;
+}
+.modal {
+  width: min(470px, 100%) !important;
+  max-height: calc(100vh - 64px) !important;
+  overflow-y: auto !important;
+  -webkit-overflow-scrolling: touch !important;
+  padding: 18px 18px calc(120px + env(safe-area-inset-bottom, 0px)) !important;
+  border-radius: 32px 32px 0 0 !important;
+}
+.modal .btn:last-child { margin-bottom: 20px; }
+.card, .btn, input, select, textarea { max-width: 100%; }
+.tableWrap { width: 100%; overflow-x: auto; }
+.stickyActions { position: sticky; bottom: 12px; background: rgba(255,255,255,.96); padding-top: 10px; }
+.formHint { font-size: 12px; color: var(--muted); line-height: 1.45; }
+.featureGrid { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+.actionRow { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+@media (max-width: 380px) {
+  .appTabs .tabText { font-size: 9px !important; }
+  .appTabs .tabIcon { font-size: 15px !important; }
+  .appTabs .tab { min-height: 54px !important; }
+  .h1 { font-size: 28px !important; }
+  .grid2, .featureGrid, .actionRow { grid-template-columns: 1fr; }
+}
+@media (min-width:800px){
+  .modalBack { align-items:center !important; padding:24px !important; }
+  .modal { border-radius:32px !important; padding-bottom:28px !important; }
+}
