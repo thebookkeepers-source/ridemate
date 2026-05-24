@@ -44,14 +44,42 @@ const esc = (v='') => String(v ?? '').replace(/[&<>"']/g, s => ({'&':'&amp;','<'
 const money = (n) => `Rs. ${Number(n || 0).toLocaleString('en-PK')}`;
 const fmt = (d) => d ? new Date(d).toLocaleString([], {month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}) : '';
 
-const withTimeout = (promise, ms=5000, label='Request timeout') => Promise.race([
-  promise,
-  new Promise((_, reject) => setTimeout(() => reject(new Error(label)), ms))
-]);
+const timeout = (ms, label='Request timeout') => new Promise((_, reject) => setTimeout(() => reject(new Error(label)), ms));
+const withTimeout = (promise, ms=6000, label='Request timeout') => Promise.race([promise, timeout(ms, label)]);
+function debounce(fn, wait=250){ let t; return (...args)=>{ clearTimeout(t); t=setTimeout(()=>fn(...args), wait); }; }
+const fallbackProfile = (session) => ({
+  id: session?.user?.id,
+  full_name: session?.user?.user_metadata?.full_name || session?.user?.email?.split('@')[0] || 'User',
+  role: session?.user?.user_metadata?.role || 'passenger',
+  gender: session?.user?.user_metadata?.gender || 'male',
+  travel_mode: 'solo',
+  status: 'active',
+  verification_status: 'unverified',
+  rating: 5
+});
+async function resetLocalApp(){
+  try {
+    await supabase.auth.signOut();
+    localStorage.clear();
+    sessionStorage.clear();
+    if (window.caches) {
+      const keys = await caches.keys();
+      await Promise.all(keys.map(k => caches.delete(k)));
+    }
+    if ('serviceWorker' in navigator) {
+      const regs = await navigator.serviceWorker.getRegistrations();
+      for (const r of regs) await r.unregister();
+    }
+  } catch(e) {}
+  location.href = location.origin + '/?v=reset-' + Date.now();
+}
+window.resetLocalApp = resetLocalApp;
+
+
 
 
 function showBoot(message='Loading RideMate...'){
-  app.innerHTML = `<div class="auth"><div class="authShell"><div class="authHero"><div class="bigIcon">${logo()}</div><div class="h1">RideMate</div><p>${esc(message)}</p></div><div class="card"><div class="h2">Starting app</div><p class="small muted">Please wait. If this screen stays for more than 10 seconds, refresh once.</p><button class="btn green" onclick="location.reload()">Reload</button></div></div></div>`;
+  app.innerHTML = `<div class="auth"><div class="authShell"><div class="authHero"><div class="bigIcon">${logo()}</div><div class="h1">RideMate</div><p>${esc(message)}</p></div><div class="card"><div class="h2">Starting app</div><p class="small muted">If this screen stays, reset local app data once.</p><div class="grid2"><button class="btn green" onclick="location.reload()">Reload</button><button class="btn ghost" onclick="resetLocalApp()">Reset app</button></div></div></div></div>`;
 }
 
 const role = () => state.profile?.role || 'passenger';
@@ -66,52 +94,56 @@ window.addEventListener('error', (event) => {
 });
 
 async function init(){
-  showBoot();
-  let bootTimedOut = false;
-  const fallback = setTimeout(() => {
-    bootTimedOut = true;
-    console.warn('Boot timeout fallback shown');
-    if (!state.session) renderAuth();
-    else render();
-    toast('Slow connection. Showing available app screen.');
-  }, 6000);
   try {
-    const { data, error } = await withTimeout(supabase.auth.getSession(), 5000, 'Supabase session timeout');
+    showBoot();
+    const { data, error } = await withTimeout(supabase.auth.getSession(), 3500, 'Session check timeout');
     if (error) throw error;
     state.session = data.session;
-    if (state.session) {
-      await withTimeout(loadMe(), 5000, 'Profile loading timeout');
-      await withTimeout(loadData(), 7000, 'App data loading timeout');
-      subscribeRealtime();
-    }
-    clearTimeout(fallback);
-    if (!bootTimedOut) render();
-  } catch (err) {
-    clearTimeout(fallback);
-    console.error('RideMate boot error:', err);
-    if (String(err.message || '').includes('timeout')) {
-      state.session = null;
+
+    if (!state.session) {
       renderAuth();
-      toast('Connection timeout. Please login again.');
       return;
     }
-    app.innerHTML = `<div class="auth"><div class="authShell"><div class="card"><div class="h1">App setup issue</div><p class="muted">${esc(err.message || err)}</p><p class="small muted">Check Netlify environment variables and Supabase URL/key.</p><button class="btn green" onclick="location.reload()">Reload</button></div></div></div>`;
+
+    // Render immediately using auth metadata. Do not block UI on database reads.
+    state.profile = fallbackProfile(state.session);
+    state.privateProfile = { user_id: state.session.user.id, phone: state.session.user.user_metadata?.phone || '' };
+    render();
+
+    // Load actual database data in background.
+    await loadMe();
+    await loadData();
+    subscribeRealtime();
+    render();
+  } catch (err) {
+    console.error('RideMate boot error:', err);
+    if (state.session) render();
+    else renderAuth();
+    setTimeout(() => toast(err.message || 'App loaded with limited data'), 300);
   }
 }
 supabase.auth.onAuthStateChange(async (_event, session) => {
   try {
     state.session = session;
-    if (session) {
-      showBoot('Signing you in...');
-      await withTimeout(loadMe(), 5000, 'Profile loading timeout');
-      await withTimeout(loadData(), 7000, 'App data loading timeout');
-      subscribeRealtime();
-    } else resetState();
+    if (!session) {
+      resetState();
+      renderAuth();
+      return;
+    }
+
+    state.profile = state.profile || fallbackProfile(session);
+    state.privateProfile = state.privateProfile || { user_id: session.user.id, phone: session.user.user_metadata?.phone || '' };
+    render();
+
+    await loadMe();
+    await loadData();
+    subscribeRealtime();
     render();
   } catch (err) {
-    console.error('Auth state error:', err);
-    toast(err.message || 'Auth loading error');
-    if (!state.profile) renderAuth(); else render();
+    console.error('Auth state warning:', err);
+    toast(err.message || 'Some data could not load');
+    if (state.session) render();
+    else renderAuth();
   }
 });
 function resetState(){
@@ -119,50 +151,93 @@ function resetState(){
 }
 
 async function loadMe(){
+  if(!state.session?.user?.id) return;
   const uid = state.session.user.id;
-  const p = await withTimeout(supabase.from('profiles').select('*').eq('id',uid).maybeSingle(), 5000, 'Profile query timeout');
-  if (p.error) throw p.error;
-  state.profile = p.data || { id: uid, full_name: state.session.user.email?.split('@')[0] || 'User', role: 'passenger', gender: 'male', travel_mode: 'solo', status: 'active', verification_status: 'unverified' };
-  const pp = await withTimeout(supabase.from('private_profiles').select('*').eq('user_id',uid).maybeSingle(), 5000, 'Private profile query timeout').catch(()=>({data:null,error:null}));
-  state.privateProfile = pp.data || { user_id: uid, phone: '' };
+
+  const [profileRes, privateRes] = await Promise.allSettled([
+    withTimeout(supabase.from('profiles').select('*').eq('id',uid).maybeSingle(), 5000, 'Profile query timeout'),
+    withTimeout(supabase.from('private_profiles').select('*').eq('user_id',uid).maybeSingle(), 5000, 'Private profile query timeout')
+  ]);
+
+  if (profileRes.status === 'fulfilled' && !profileRes.value.error && profileRes.value.data) {
+    state.profile = profileRes.value.data;
+  } else {
+    console.warn('Using fallback profile', profileRes.reason || profileRes.value?.error);
+    state.profile = state.profile || fallbackProfile(state.session);
+  }
+
+  if (privateRes.status === 'fulfilled' && !privateRes.value.error && privateRes.value.data) {
+    state.privateProfile = privateRes.value.data;
+  } else {
+    state.privateProfile = state.privateProfile || { user_id: uid, phone: '' };
+  }
 }
 async function loadData(){
   if(!state.session) return;
   const uid = state.session.user.id;
   const nowIso = new Date().toISOString();
-  const run = async (query, fallback=[]) => {
+
+  const run = async (query, label) => {
     try {
-      const {data, error} = await query;
-      if (error) { console.warn('Query warning:', error.message); return fallback; }
-      return data || fallback;
-    } catch(e) { console.warn('Query failed:', e.message); return fallback; }
+      const { data, error } = await withTimeout(query, 7000, `${label} timeout`);
+      if (error) {
+        console.warn(`${label} warning:`, error.message);
+        return [];
+      }
+      return data || [];
+    } catch (e) {
+      console.warn(`${label} failed:`, e.message);
+      return [];
+    }
   };
-  state.rides = await run(supabase.from('rides_public').select('*').eq('status','open').gt('departure_at', nowIso).order('departure_at',{ascending:true}).limit(100));
-  state.myRides = await run(supabase.from('rides_public').select('*').eq('driver_id',uid).order('departure_at',{ascending:false}).limit(100));
-  const allBookings = await run(supabase.from('bookings_public').select('*').or(`passenger_id.eq.${uid},driver_id.eq.${uid}`).order('created_at',{ascending:false}).limit(150));
+
+  const queries = {
+    rides: run(supabase.from('rides_public').select('*').eq('status','open').gt('departure_at', nowIso).order('departure_at',{ascending:true}).limit(100), 'rides'),
+    myRides: run(supabase.from('rides_public').select('*').eq('driver_id',uid).order('departure_at',{ascending:false}).limit(100), 'my rides'),
+    bookings: run(supabase.from('bookings_public').select('*').or(`passenger_id.eq.${uid},driver_id.eq.${uid}`).order('created_at',{ascending:false}).limit(150), 'bookings'),
+    history: run(supabase.from('trip_history_public').select('*').or(`passenger_id.eq.${uid},driver_id.eq.${uid}`).order('created_at',{ascending:false}).limit(100), 'history'),
+    vehicles: run(supabase.from('vehicles').select('*').eq('owner_id',uid).order('created_at',{ascending:false}), 'vehicles'),
+    docs: run(supabase.from('driver_documents').select('*').eq('user_id',uid), 'documents'),
+    locations: run(supabase.from('trip_locations').select('*').order('created_at',{ascending:false}).limit(100), 'locations'),
+    notifications: run(supabase.from('notifications').select('*').eq('user_id',uid).order('created_at',{ascending:false}).limit(20), 'notifications')
+  };
+
+  const result = await Promise.all(Object.values(queries));
+  const [rides, myRides, allBookings, history, vehicles, docs, locations, notifications] = result;
+
+  state.rides = rides;
+  state.myRides = myRides;
   state.myBookings = allBookings.filter(b=>b.passenger_id===uid);
   state.requests = allBookings.filter(b=>b.driver_id===uid);
-  state.history = await run(supabase.from('trip_history_public').select('*').or(`passenger_id.eq.${uid},driver_id.eq.${uid}`).order('created_at',{ascending:false}).limit(100));
-  state.vehicles = await run(supabase.from('vehicles').select('*').eq('owner_id',uid).order('created_at',{ascending:false}));
-  state.documents = await run(supabase.from('driver_documents').select('*').eq('user_id',uid));
-  state.locations = await run(supabase.from('trip_locations').select('*').order('created_at',{ascending:false}).limit(100));
-  state.notifications = await run(supabase.from('notifications').select('*').eq('user_id',uid).order('created_at',{ascending:false}).limit(20));
+  state.history = history;
+  state.vehicles = vehicles;
+  state.documents = docs;
+  state.locations = locations;
+  state.notifications = notifications;
+
   if(isAdmin()){
-    state.users = await run(supabase.from('profiles').select('*').order('created_at',{ascending:false}).limit(200));
-    state.reports = await run(supabase.from('reports_public').select('*').order('created_at',{ascending:false}).limit(100));
-    state.documents = await run(supabase.from('driver_documents_public').select('*').order('created_at',{ascending:false}).limit(200));
+    const [users, reports, adminDocs] = await Promise.all([
+      run(supabase.from('profiles').select('*').order('created_at',{ascending:false}).limit(200), 'admin users'),
+      run(supabase.from('reports_public').select('*').order('created_at',{ascending:false}).limit(100), 'admin reports'),
+      run(supabase.from('driver_documents_public').select('*').order('created_at',{ascending:false}).limit(200), 'admin documents')
+    ]);
+    state.users = users;
+    state.reports = reports;
+    state.documents = adminDocs;
   }
 }
-
 let channel;
 function subscribeRealtime(){
-  if(channel) return;
-  channel = supabase.channel('ridemate-v2')
-    .on('postgres_changes',{event:'*',schema:'public',table:'rides'},()=>loadData().then(render))
-    .on('postgres_changes',{event:'*',schema:'public',table:'bookings'},()=>loadData().then(render))
-    .on('postgres_changes',{event:'*',schema:'public',table:'trip_locations'},()=>loadData().then(render))
+  if(channel || !state.session?.user?.id) return;
+  const uid = state.session.user.id;
+  // Targeted realtime only. Broad table subscriptions are avoided for scale.
+  channel = supabase.channel(`ridemate-user-${uid}`)
+    .on('postgres_changes',{event:'INSERT',schema:'public',table:'notifications',filter:`user_id=eq.${uid}`},()=>loadData().then(render).catch(console.warn))
+    .on('postgres_changes',{event:'UPDATE',schema:'public',table:'notifications',filter:`user_id=eq.${uid}`},()=>loadData().then(render).catch(console.warn))
     .subscribe();
 }
+// Lightweight polling fallback. Keeps app fresh without heavy global realtime.
+setInterval(()=>{ if(state.session && document.visibilityState==='visible') loadData().then(render).catch(console.warn); }, 45000);
 
 function renderAuth(){
   const isSignup = state.authMode==='signup';
@@ -182,13 +257,19 @@ async function doSignup(e){
 }
 
 function render(){
-  if(!state.session) return renderAuth();
-  const tabs = navTabs();
-  app.innerHTML = `<div class="shell"><div class="statusCap"></div><div class="top"><div class="brand"><div class="appIcon">${logo()}</div><div><div class="title">${cfg.appName}</div><div class="sub">${esc(state.profile?.full_name)} · ${esc(role())}</div></div></div><button class="logoutBtn" id="logoutBtn">Logout</button></div><main class="content">${view()}</main>${state.modal||''}<nav class="tabs">${tabs.map(t=>`<button class="tab ${state.tab===t.id?'active':''}" data-tab="${t.id}"><span class="tabIcon">${t.icon}</span>${t.label}</button>`).join('')}</nav></div>`;
-  $('#logoutBtn').onclick=()=>supabase.auth.signOut();
-  document.querySelectorAll('[data-tab]').forEach(b=>b.onclick=()=>{state.tab=b.dataset.tab; state.modal=null; render();});
-  bindEvents();
+  try {
+    if(!state.session) return renderAuth();
+    const tabs = navTabs();
+    app.innerHTML = `<div class="shell mobileShell"><div class="statusCap"></div><header class="appHeader"><div class="brand"><div class="appIcon">${logo()}</div><div><div class="title">${cfg.appName}</div><div class="sub">${esc(state.profile?.full_name)} · ${esc(role())}</div></div></div><div class="headerActions"><button class="headerAction" id="refreshBtn">↻</button><button class="headerAction" id="logoutBtn">Logout</button></div></header><main class="content appContent">${view()}</main>${state.modal||''}<nav class="tabs appTabs">${tabs.map(t=>`<button class="tab ${state.tab===t.id?'active':''}" data-tab="${t.id}"><span class="tabIcon">${t.icon}</span><span class="tabText">${t.label}</span></button>`).join('')}</nav></div>`;
+    $('#logoutBtn').onclick=()=>supabase.auth.signOut(); const rb=$('#refreshBtn'); if(rb) rb.onclick=()=>loadData().then(render).catch(e=>toast(e.message||'Refresh failed'));
+    document.querySelectorAll('[data-tab]').forEach(b=>b.onclick=()=>{state.tab=b.dataset.tab; state.modal=null; render();});
+    bindEvents();
+  } catch (err) {
+    console.error('Render error:', err);
+    app.innerHTML = `<div class="auth"><div class="card"><div class="h1">App error</div><p class="muted">${esc(err.message || err)}</p><button class="btn green" onclick="location.reload()">Reload</button></div></div>`;
+  }
 }
+
 function navTabs(){
   if(isAdmin()) return [{id:'home',label:'Admin',icon:'📊'},{id:'kyc',label:'KYC',icon:'✅'},{id:'adminRides',label:'Rides',icon:'🚗'},{id:'reports',label:'Reports',icon:'🛟'},{id:'profile',label:'Me',icon:'👤'}];
   if(role()==='driver') return [{id:'home',label:'Home',icon:'🏠'},{id:'create',label:'Post',icon:'➕'},{id:'trip',label:'Trip',icon:'🚦'},{id:'requests',label:'Requests',icon:'📩'},{id:'history',label:'History',icon:'🧾'},{id:'profile',label:'Me',icon:'👤'}];
@@ -219,19 +300,70 @@ function compatible(r){
 }
 function routeSummary(r){ return [r.trip_type, r.recurrence_type && r.recurrence_type!=='once'?r.recurrence_type:'', r.allow_monthly_booking?'monthly seats':''].filter(Boolean).join(' · '); }
 
+
+function getRouteAreas(){
+  const templateAreas = ROUTE_TEMPLATES.flatMap(r => [r.from, r.to, r.name, r.via]);
+  return templateAreas
+    .concat(ROUTE_SUGGESTIONS)
+    .concat([
+      'Wah Cantt','Wah Barrier 1','Wah Barrier 2','Wah Barrier 3','Barrier 1','Barrier 2','Barrier 3',
+      'New City Phase 1','New City Phase 2','New City Phase 3','Lalazar Wah Cantt','Taxila','HIT Taxila','Taxila Bypass',
+      'Islamabad','Blue Area','F-6','F-7','F-8','F-10','F-11','G-9','G-10','G-11','G-13','G-14','I-8','I-9','I-10','H-8','H-9','Faizabad','Zero Point',
+      'Rawalpindi','Saddar Rawalpindi','Raja Bazaar','Committee Chowk','6th Road','Commercial Market','Chandni Chowk','Marrir Chowk','Peshawar Road'
+    ])
+    .filter(Boolean);
+}
+const UNIQUE_AREAS=[...new Set(getRouteAreas().filter(Boolean))].sort((a,b)=>a.localeCompare(b));
+function locationSuggestHtml(inputId,value,placeholder,label){
+  const q=(value||'').toLowerCase().trim();
+  const matches=UNIQUE_AREAS.filter(x=>!q||x.toLowerCase().includes(q)).slice(0,10);
+  return `<div class="locBox"><label>${label}<input id="${inputId}" data-loc-input="${inputId}" value="${esc(value||'')}" placeholder="${esc(placeholder)}" autocomplete="off"></label><div class="locDropdown ${q?'open':''}" data-loc-menu="${inputId}">${matches.map(x=>`<button type="button" class="locOption" data-loc-target="${inputId}" data-loc-value="${esc(x)}">${esc(x)}</button>`).join('')||'<div class="locEmpty">No matching location</div>'}</div></div>`;
+}
+function updateLocationMenu(input){
+  const menu=input.closest('.locBox')?.querySelector('.locDropdown'); if(!menu) return;
+  const q=input.value.toLowerCase().trim();
+  const matches=UNIQUE_AREAS.filter(x=>!q||x.toLowerCase().includes(q)).slice(0,10);
+  menu.classList.add('open');
+  menu.innerHTML=matches.map(x=>`<button type="button" class="locOption" data-loc-target="${input.id}" data-loc-value="${esc(x)}">${esc(x)}</button>`).join('')||'<div class="locEmpty">No matching location</div>';
+  menu.querySelectorAll('[data-loc-value]').forEach(btn=>btn.onclick=()=>{input.value=btn.dataset.locValue; menu.classList.remove('open');});
+}
+function bindLocationDropdowns(){
+  document.querySelectorAll('[data-loc-input]').forEach(input=>{
+    input.oninput=()=>updateLocationMenu(input);
+    input.onfocus=()=>updateLocationMenu(input);
+    input.onblur=()=>setTimeout(()=>input.closest('.locBox')?.querySelector('.locDropdown')?.classList.remove('open'),150);
+  });
+  document.querySelectorAll('[data-loc-value]').forEach(btn=>btn.onclick=()=>{const t=document.getElementById(btn.dataset.locTarget); if(t){t.value=btn.dataset.locValue;t.closest('.locBox')?.querySelector('.locDropdown')?.classList.remove('open');}});
+}
+
 function notificationBanner(){
   const unread = state.notifications.filter(n=>!n.is_read).slice(0,3);
   if(!unread.length) return '';
   return `<div class="card noticeCard"><div class="h2">Notifications</div>${unread.map(n=>`<div class="alert" style="margin-top:8px"><b>${esc(n.title)}</b><br>${esc(n.body)}</div>`).join('')}<button class="btn ghost" id="markNotificationsRead" style="margin-top:10px">Mark as read</button></div>`;
 }
 
+async function performRideSearch(from, to, time='any', rule='safe'){
+  state.filters.from = from || '';
+  state.filters.to = to || '';
+  state.filters.time = time || 'any';
+  state.filters.rule = rule || 'safe';
+  try {
+    const { data, error } = await supabase.rpc('search_rides_v2', { p_from: state.filters.from || null, p_to: state.filters.to || null, p_limit: 100 });
+    if(error) throw error;
+    state.rides = data || [];
+  } catch (e) {
+    // fallback to local filtering if RPC is not deployed yet
+    console.warn('search_rides_v2 fallback:', e.message);
+  }
+}
+
 function passengerHome(){
-  let rides = state.rides.filter(r=>r.driver_id!==state.session.user.id);
-  if(state.filters.from) rides = rides.filter(r => [r.from_city,r.pickup_area,r.via_route].join(' ').toLowerCase().includes(state.filters.from.toLowerCase()));
-  if(state.filters.to) rides = rides.filter(r => [r.to_city,r.dropoff_area,r.via_route].join(' ').toLowerCase().includes(state.filters.to.toLowerCase()));
-  if(state.filters.rule==='safe') rides = rides.filter(r=>compatible(r).ok);
-  const cards = rides.map(rideCard).join('') || `<div class="empty">No future rides found. Save your route or try a nearby pickup point.</div>`;
-  return `${notificationBanner()}<div class="card hero"><div class="h1">Find your seat</div><p>Search any pickup and destination. Rides with expired departure times are hidden automatically.</p></div><form id="searchForm" class="card"><div class="h2">Search route</div><div class="grid"><label>From / pickup<input name="from" id="fFrom" list="routeSuggestions" value="${esc(state.filters.from)}" placeholder="New City Phase 2" autocomplete="off"></label><label>To / dropoff<input name="to" id="fTo" list="routeSuggestions" value="${esc(state.filters.to)}" placeholder="Blue Area Islamabad" autocomplete="off"></label><div class="grid2"><label>Time<select name="time" id="fTime"><option value="any" ${state.filters.time==='any'?'selected':''}>Any</option><option value="morning" ${state.filters.time==='morning'?'selected':''}>Morning</option><option value="evening" ${state.filters.time==='evening'?'selected':''}>Evening</option></select></label><label>Filter<select name="rule" id="fRule"><option value="safe" ${state.filters.rule==='safe'?'selected':''}>Safe match</option><option value="all" ${state.filters.rule==='all'?'selected':''}>All rides</option></select></label></div><button class="btn green">Search rides</button></div>${suggestions()}</form>${cards}<div class="card"><button type="button" class="btn ghost" id="saveRouteBtn">Save this route for later alerts</button></div>`;
+  let rides=state.rides.filter(r=>r.driver_id!==state.session.user.id);
+  if(state.filters.from) rides=rides.filter(r=>[r.from_city,r.pickup_area,r.via_route].join(' ').toLowerCase().includes(state.filters.from.toLowerCase()));
+  if(state.filters.to) rides=rides.filter(r=>[r.to_city,r.dropoff_area,r.via_route].join(' ').toLowerCase().includes(state.filters.to.toLowerCase()));
+  if(state.filters.rule==='safe') rides=rides.filter(r=>compatible(r).ok);
+  const cards=rides.map(rideCard).join('')||`<div class="empty">No future rides found. Try a nearby pickup point or ask a driver to post this route.</div>`;
+  return `${notificationBanner()}<div class="screenTitle"><div><div class="h1">Find your seat</div><p class="muted">Search pickup and destination.</p></div><span class="pill green">online</span></div><form id="searchForm" class="card"><div class="h2">Search rides</div><div class="grid">${locationSuggestHtml('fFrom',state.filters.from,'New City Phase 2','From / pickup')}${locationSuggestHtml('fTo',state.filters.to,'Blue Area Islamabad','To / dropoff')}<div class="grid2"><label>Time<select name="time" id="fTime"><option value="any" ${state.filters.time==='any'?'selected':''}>Any</option><option value="morning" ${state.filters.time==='morning'?'selected':''}>Morning</option><option value="evening" ${state.filters.time==='evening'?'selected':''}>Evening</option></select></label><label>Filter<select name="rule" id="fRule"><option value="safe" ${state.filters.rule==='safe'?'selected':''}>Safe match</option><option value="all" ${state.filters.rule==='all'?'selected':''}>All rides</option></select></label></div><button class="btn green">Search rides</button></div></form>${cards}<div class="card"><button type="button" class="btn ghost" id="saveRouteBtn">Save this route for later alerts</button></div>`;
 }
 
 function rideCard(r){
@@ -247,15 +379,12 @@ function driverHome(){
 }
 
 function createRideView(){
-  if(state.profile?.verification_status!=='verified') return `<div class="card"><div class="h1">KYC required</div><p class="muted">Drivers can post public rides only after admin approves CNIC, license, vehicle registration and selfie verification.</p><button class="btn green" data-tab-go="profile">Complete driver KYC</button></div>`;
-  const opts=state.vehicles.map(v=>`<option value="${v.id}">${esc(v.car_model)} · ${esc(v.plate_number)}</option>`).join('');
-  return `<div class="card"><div class="h1">Post ride</div><form id="rideForm" class="grid"><label>Vehicle<select name="vehicle_id" required>${opts}</select></label><label>Route template<select id="templateSelect"><option value="">Custom route</option>${ROUTE_TEMPLATES.map((r,i)=>`<option value="${i}">${esc(r.name)}</option>`).join('')}</select></label><div class="grid2"><label>From<input name="from_city" list="routeSuggestions" required placeholder="Barrier 3"></label><label>To<input name="to_city" list="routeSuggestions" required placeholder="Blue Area"></label></div><div class="grid2"><label>Pickup point<input name="pickup_area" list="routeSuggestions" required></label><label>Dropoff point<input name="dropoff_area" list="routeSuggestions" required></label></div><label>Via / route details<input name="via_route" placeholder="Taxila → Golra → G-9"></label><div class="grid2"><label>Departure<input name="departure_at" type="datetime-local" required></label><label>Seats<input name="total_seats" type="number" min="1" max="6" value="3" required></label></div><div class="grid2"><label>Price / seat<input name="price_per_seat" type="number" min="0" value="500" required></label><label>Trip type<select name="trip_type"><option value="one_way">One way</option><option value="morning">Morning</option><option value="evening">Evening</option><option value="return">Return</option></select></label></div><div class="grid2"><label>Recurring<select name="recurrence_type"><option value="once">One time</option><option value="daily">Daily</option><option value="weekdays">Monday-Friday</option><option value="custom">Custom days</option></select></label><label>Custom days<input name="recurrence_days" placeholder="Mon,Tue,Wed"></label></div><div class="grid2"><label>Monthly seats<select name="allow_monthly_booking"><option value="false">No</option><option value="true">Yes</option></select></label><label>Monthly price<input name="monthly_price" type="number" min="0"></label></div><label>Passenger rule<select name="ride_rule"><option value="mixed">Mixed</option><option value="male_only">Male only</option><option value="female_only">Female only</option><option value="family_only">Family only</option></select></label><label>Notes<textarea name="notes" placeholder="Pickup flexibility, office gate, payment terms"></textarea></label>${suggestions()}<button class="btn green">Post ride</button></form></div>`;
+  if(role()!=='driver') return `<div class="empty">Only drivers can post rides.</div>`;
+  if(state.profile.verification_status!=='verified') return `<div class="card"><div class="h1">KYC required</div><p class="muted">Submit CNIC, license, vehicle registration and selfie. Admin approval is required before posting public rides.</p><button class="btn green" onclick="state.tab='profile';render()">Open profile & upload documents</button></div>`;
+  if(!state.vehicles.length) return `<div class="card"><div class="h1">Add vehicle first</div><p class="muted">A verified vehicle improves passenger trust.</p><button class="btn green" onclick="state.tab='profile';render()">Add vehicle</button></div>`;
+  return `<form id="rideForm" class="card"><div class="h1">Post a ride</div><p class="muted">Use searchable location fields so passengers can find your ride easily.</p><div class="grid"><label>Vehicle<select name="vehicle_id">${state.vehicles.map(v=>`<option value="${v.id}">${esc(v.car_model || v.make || '')} ${esc(v.model || '')} · ${esc(v.plate_number)}</option>`).join('')}</select></label>${locationSuggestHtml('rFrom','Wah Cantt','Wah Cantt','From city / start area')}${locationSuggestHtml('rTo','Islamabad','Islamabad','To city / destination')}${locationSuggestHtml('rPickup','Barrier 3','Barrier 3','Main pickup area')}${locationSuggestHtml('rDropoff','Blue Area','Blue Area','Main dropoff area')}<label>Via route<input name="via_route" id="rVia" placeholder="GT Road → Taxila → Golra → G-9/G-8"></label><div class="grid2"><label>Departure date/time<input name="departure_at" type="datetime-local" required></label><label>Seats<input name="total_seats" type="number" min="1" max="6" value="1"></label></div><div class="grid2"><label>Price per seat<input name="price_per_seat" type="number" min="0" value="300"></label><label>Ride rule<select name="ride_rule"><option value="mixed">Mixed</option><option value="male_only">Male only</option><option value="female_only">Female only</option><option value="family_only">Family only</option></select></label></div><label>Driver notes<textarea name="notes" placeholder="Example: I can pickup from New City Phase 2 if nearby."></textarea></label><button class="btn green">Publish ride</button></div></form>`;
 }
 
-function bookingsView(){ return state.myBookings.map(bookingCard).join('') || `<div class="empty">No trips yet.</div>`; }
-function bookingCard(b){
-  return `<div class="card"><div class="row"><div><div class="route">${esc(b.from_city)} → ${esc(b.to_city)}</div><div class="small">Driver: ${esc(b.driver_name)} · ${fmt(b.departure_at)}</div></div><span class="pill ${b.status==='accepted'||b.status==='active'?'green':b.status==='pending'?'warn':'bad'}">${esc(b.status)}</span></div>${b.note?`<div class="alert" style="margin-top:12px"><b>Pickup request:</b><br>${esc(b.note)}</div>`:''}<div class="line"></div><div class="grid2"><button class="btn green" data-start-live="${b.id}" ${!['accepted','active'].includes(b.status)?'disabled':''}>Live trip</button><button class="btn ghost" data-contact="${b.id}" ${!['accepted','active'].includes(b.status)?'disabled':''}>Contact</button></div><button class="btn danger" style="margin-top:10px" data-cancel="${b.id}" ${!['pending','accepted'].includes(b.status)?'disabled':''}>Cancel request</button></div>`;
-}
 function driverTripView(){
   const accepted = state.requests.filter(b=>['accepted','active'].includes(b.status));
   const rideIds = [...new Set(accepted.map(b=>b.ride_id))];
@@ -263,9 +392,9 @@ function driverTripView(){
     const ride = state.myRides.find(r=>r.id===rideId) || accepted.find(b=>b.ride_id===rideId);
     const passengers = accepted.filter(b=>b.ride_id===rideId);
     const activeCount = passengers.filter(b=>b.status==='active').length;
-    return `<div class="card"><div class="row"><div><div class="route">${esc(ride.from_city)} → ${esc(ride.to_city)}</div><div class="small">${fmt(ride.departure_at)} · ${passengers.length} accepted passengers · ${activeCount} active</div></div><span class="pill ${activeCount?'green':'warn'}">${activeCount?'started':'ready'}</span></div><div class="line"></div><div class="h3">Accepted passengers</div>${passengers.map(p=>`<div class="row passengerLine"><span>${esc(p.passenger_name)}<br><span class="small">${esc(p.note || 'No pickup note')}</span></span><span class="pill ${p.status==='active'?'green':'blue'}">${esc(p.status)}</span></div>`).join('')}<div class="line"></div><div class="grid"><button class="btn green" data-start-ride-all="${rideId}">Start ride & notify passengers</button><button class="btn ghost" data-share-driver-location="${rideId}">Share live location now</button><button class="btn danger" data-close="${rideId}">Close ride</button></div></div>`;
+    return `<div class="card"><div class="row"><div><div class="route">${esc(ride.from_city)} → ${esc(ride.to_city)}</div><div class="small">${fmt(ride.departure_at)} · ${passengers.length} accepted passengers · ${activeCount} active</div></div><span class="pill ${activeCount?'green':'warn'}">${activeCount?'ride started':'ready'}</span></div><div class="line"></div><div class="h3">Accepted passengers</div>${passengers.map(p=>`<div class="row passengerLine"><span>${esc(p.passenger_name)}<br><span class="small">${esc(p.note || 'No pickup note')}</span></span><span class="pill ${p.status==='active'?'green':'blue'}">${esc(p.status)}</span></div>`).join('')}<div class="line"></div><div class="grid"><button class="btn green" data-start-ride-all="${rideId}">Start ride & notify passengers</button><button class="btn ghost" data-share-driver-location="${rideId}">Share location now</button><button class="btn danger" data-end-ride-all="${rideId}" ${activeCount?'':'disabled'}>End ride & complete trip</button></div></div>`;
   }).join('');
-  return `<div class="card hero"><div class="h1">Trip control</div><p>When the driver leaves home, press Start ride. All accepted passengers will be notified and driver location can be shared from here.</p></div>${cards || '<div class="empty">No accepted passengers yet. Accepted requests will appear here.</div>'}`;
+  return `<div class="screenTitle"><div><div class="h1">Trip control</div><p class="muted">Start, share location, and end rides.</p></div><span class="pill green">driver</span></div>${cards || '<div class="empty">No accepted passengers yet. Accepted requests will appear here.</div>'}`;
 }
 
 function requestsView(){ return `<div class="card"><div class="h2">Passenger requests</div><p class="small muted">Accept requests here. After accepting, use the Trip tab to start the ride and notify all accepted passengers.</p></div>` + (state.requests.map(requestCard).join('') || `<div class="empty">No passenger requests yet.</div>`); }
@@ -273,12 +402,39 @@ function requestCard(b){
   return `<div class="card"><div class="row"><div><div class="route">${esc(b.passenger_name)}</div><div class="small">${esc(b.passenger_gender)} · ${esc(b.from_city)} → ${esc(b.to_city)}</div></div><span class="pill ${b.status==='pending'?'warn':'green'}">${esc(b.status)}</span></div>${b.note?`<div class="alert" style="margin-top:12px"><b>Passenger pickup request:</b><br>${esc(b.note)}</div>`:''}<div class="line"></div><div class="grid2"><button class="btn green" data-accept="${b.id}" ${b.status!=='pending'?'disabled':''}>Accept</button><button class="btn ghost" data-reject="${b.id}" ${b.status!=='pending'?'disabled':''}>Reject</button></div><button class="btn green" style="margin-top:10px" data-active="${b.id}" ${b.status!=='accepted'?'disabled':''}>Start live trip</button></div>`;
 }
 
+
+
+function googleMapsUrl(lat, lng){
+  return `https://www.google.com/maps?q=${encodeURIComponent(lat + ',' + lng)}`;
+}
+function googleMapsDirectionsUrl(fromLoc, toText){
+  if(!fromLoc) return '';
+  return `https://www.google.com/maps/dir/?api=1&origin=${encodeURIComponent(fromLoc.lat + ',' + fromLoc.lng)}&destination=${encodeURIComponent(toText || '')}&travelmode=driving`;
+}
+function shareLocationMessage(booking, loc){
+  if(!loc) return 'RideMate live location is not available yet.';
+  return `RideMate live location: ${googleMapsUrl(loc.lat, loc.lng)}\\nRoute: ${booking.from_city} to ${booking.to_city}`;
+}
+
+function latestLocationForBooking(bookingId, userId){
+  return state.locations.find(l => l.booking_id === bookingId && (!userId || l.user_id === userId));
+}
+function staticMapBox(loc, title='Live location', destination=''){
+  if(!loc) return `<div class="nativeMapCard"><div class="mapBlank"><div class="mapPin">📍</div><div><b>Waiting for location</b><br><span>Driver/passenger has not shared live GPS yet.</span></div></div></div>`;
+  const mapsUrl = googleMapsUrl(loc.lat, loc.lng);
+  const dirUrl = googleMapsDirectionsUrl(loc, destination);
+  return `<div class="nativeMapCard"><div class="mapPreview"><div class="routeLine"></div><div class="movingPin">📍</div><div class="mapInfo"><b>${esc(title)}</b><br>Updated: ${fmt(loc.created_at)}<br>${Number(loc.lat).toFixed(5)}, ${Number(loc.lng).toFixed(5)}</div></div><div class="grid2" style="margin-top:12px"><a class="btn green mapBtn" href="${mapsUrl}" target="_blank" rel="noopener">Open map</a><a class="btn ghost mapBtn" href="${dirUrl || mapsUrl}" target="_blank" rel="noopener">Directions</a></div></div>`;
+}
+
 function liveView(){
   const active = state.myBookings.find(b=>['accepted','active'].includes(b.status)) || state.requests.find(b=>['accepted','active'].includes(b.status));
-  if(!active) return `<div class="card"><div class="h1">Live trip</div><p class="muted">Live location appears after a booking is accepted and the driver starts the trip.</p></div>`;
+  if(!active) return `<div class="screenTitle"><div><div class="h1">Live trip</div><p class="muted">Live location appears after a booking is accepted and the driver starts the trip.</p></div></div><div class="empty">No active trip yet.</div>`;
   const isPassenger = active.passenger_id === state.session.user.id;
-  const latestDriverLoc = state.locations.find(l => l.booking_id === active.id && l.user_id === active.driver_id);
-  return `<div class="card hero"><div class="h1">Live trip</div><p>${esc(active.from_city)} → ${esc(active.to_city)}</p></div><div class="card"><div class="map"><div class="pin a"></div><div class="pin b"></div><div class="pulse"></div></div><div class="line"></div>${isPassenger ? `<div class="alert"><b>Driver live location</b><br>${latestDriverLoc ? `Last shared: ${fmt(latestDriverLoc.created_at)}<br>Lat: ${latestDriverLoc.lat}, Lng: ${latestDriverLoc.lng}` : 'Waiting for driver to share live location after trip starts.'}</div>` : `<div class="alert"><b>Driver mode</b><br>Tap below to share your current location with all accepted passengers for this trip.</div>`}<div class="grid" style="margin-top:12px"><button class="btn green" id="shareLocationBtn">${isPassenger ? 'Share my location too' : 'Share driver live location'}</button><button class="btn ghost" id="familyShareBtn">Copy family tracking message</button><button class="btn danger" id="sosBtn">Emergency SOS</button></div></div>`;
+  const driverLoc = latestLocationForBooking(active.id, active.driver_id);
+  const passengerLoc = latestLocationForBooking(active.id, active.passenger_id);
+  const visibleLoc = isPassenger ? driverLoc : (driverLoc || passengerLoc);
+  const shareText = shareLocationMessage(active, visibleLoc);
+  return `<div class="screenTitle"><div><div class="h1">Live trip</div><p class="muted">${esc(active.from_city)} → ${esc(active.to_city)}</p></div><span class="pill ${visibleLoc?'green':'warn'}">${visibleLoc?'location on':'waiting'}</span></div>${staticMapBox(visibleLoc, isPassenger?'Driver live location':'Shared ride location', active.dropoff_area || active.to_city)}<div class="card nativePanel"><div class="h2">${isPassenger ? 'Passenger live view' : 'Driver live controls'}</div><p class="small muted">${isPassenger ? 'When driver shares GPS, open Google Maps to see latest location and directions.' : 'Turn location on when leaving for pickup. Accepted passengers will receive live location.'}</p><div class="grid"><button class="btn green" id="shareLocationBtn">${isPassenger ? 'Share my pickup location' : 'Share live location now'}</button><button class="btn ghost" id="copyMapsLinkBtn" ${visibleLoc?'':'disabled'}>Copy Google Maps link</button><button class="btn ghost" id="familyShareBtn" ${visibleLoc?'':'disabled'}>Copy family tracking message</button><button class="btn danger" id="sosBtn">Emergency SOS</button></div></div>`;
 }
 
 function historyView(){
@@ -291,7 +447,7 @@ function profileView(){
   const isDriver = role()==='driver';
   const vehicles = state.vehicles.map(v=>`<div class="row"><span>${esc(v.car_model)} · ${esc(v.plate_number)}</span><span class="pill ${v.is_verified?'green':'warn'}">${v.is_verified?'verified':'pending'}</span></div>`).join('') || '<p class="small muted">No vehicle added.</p>';
   const docs = ['cnic_front','cnic_back','license','vehicle_registration','selfie'].map(t=>`<div class="row"><span>${labelDoc(t)}</span><span class="pill ${state.documents.find(d=>d.doc_type===t && d.status==='approved')?'green':state.documents.find(d=>d.doc_type===t)?'warn':'bad'}">${state.documents.find(d=>d.doc_type===t)?.status || 'missing'}</span></div>`).join('');
-  return `<div class="card"><div class="h1">Profile</div><form id="profileForm" class="grid"><label>Full name<input name="full_name" value="${esc(p.full_name)}" required></label><div class="grid2"><label>Gender<select name="gender"><option value="male" ${p.gender==='male'?'selected':''}>Male</option><option value="female" ${p.gender==='female'?'selected':''}>Female</option></select></label><label>Travel mode<select name="travel_mode"><option value="solo" ${p.travel_mode==='solo'?'selected':''}>Solo</option><option value="family" ${p.travel_mode==='family'?'selected':''}>Family</option></select></label></div><label>Phone<input name="phone" value="${esc(pp.phone||'')}" required></label><label>Emergency contact<input name="emergency_contact" value="${esc(pp.emergency_contact||'')}" placeholder="Family phone"></label><button class="btn green">Save profile</button></form></div>${isDriver?`<div class="card"><div class="h2">Driver verification</div><div class="meta"><span class="pill ${p.verification_status==='verified'?'green':'warn'}">${esc(p.verification_status||'pending')}</span></div><div class="line"></div>${docs}<div class="line"></div><form id="docForm" class="grid"><label>Document type<select name="doc_type"><option value="cnic_front">CNIC front</option><option value="cnic_back">CNIC back</option><option value="license">Driving license</option><option value="vehicle_registration">Vehicle registration</option><option value="selfie">Selfie verification</option></select></label><label>Upload image<input name="file" type="file" accept="image/*" required></label><p class="small muted">Upload a clear image. Admin will review it before driver approval.</p><button class="btn">Upload document</button></form></div><div class="card"><div class="h2">Vehicles</div>${vehicles}<div class="line"></div><form id="vehicleForm" class="grid"><div class="grid2"><label>Car model<input name="car_model" required placeholder="Honda City"></label><label>Plate number<input name="plate_number" required placeholder="ABC-123"></label></div><label>Color<input name="color" placeholder="White"></label><button class="btn">Add vehicle</button></form></div>`:''}`;
+  return `<div class="card"><div class="h1">Profile</div><form id="profileForm" class="grid"><label>Full name<input name="full_name" value="${esc(p.full_name)}" required></label><div class="grid2"><label>Gender<select name="gender"><option value="male" ${p.gender==='male'?'selected':''}>Male</option><option value="female" ${p.gender==='female'?'selected':''}>Female</option></select></label><label>Travel mode<select name="travel_mode"><option value="solo" ${p.travel_mode==='solo'?'selected':''}>Solo</option><option value="family" ${p.travel_mode==='family'?'selected':''}>Family</option></select></label></div><label>Phone<input name="phone" value="${esc(pp.phone||'')}" required></label><label>Emergency contact<input name="emergency_contact" value="${esc(pp.emergency_contact||'')}" placeholder="Family phone"></label><button class="btn green">Save profile</button></form><button class="btn ghost" style="margin-top:10px" onclick="resetLocalApp()">Reset local app data</button></div>${isDriver?`<div class="card"><div class="h2">Driver verification</div><div class="meta"><span class="pill ${p.verification_status==='verified'?'green':'warn'}">${esc(p.verification_status||'pending')}</span></div><div class="line"></div>${docs}<div class="line"></div><form id="docForm" class="grid"><label>Document type<select name="doc_type"><option value="cnic_front">CNIC front</option><option value="cnic_back">CNIC back</option><option value="license">Driving license</option><option value="vehicle_registration">Vehicle registration</option><option value="selfie">Selfie verification</option></select></label><label>Upload image<input name="file" type="file" accept="image/*" required></label><p class="small muted">Upload a clear image. Admin will review it before driver approval.</p><button class="btn">Upload document</button></form></div><div class="card"><div class="h2">Vehicles</div>${vehicles}<div class="line"></div><form id="vehicleForm" class="grid"><div class="grid2"><label>Car model<input name="car_model" required placeholder="Honda City"></label><label>Plate number<input name="plate_number" required placeholder="ABC-123"></label></div><label>Color<input name="color" placeholder="White"></label><button class="btn">Add vehicle</button></form></div>`:''}`;
 }
 function labelDoc(t){ return ({cnic_front:'CNIC front',cnic_back:'CNIC back',license:'Driving license',vehicle_registration:'Vehicle registration',selfie:'Selfie verification'}[t]||t); }
 
@@ -327,8 +483,9 @@ function adminRides(){ return `<div class="card"><div class="h1">Rides</div><tab
 function adminReports(){ return `<div class="card"><div class="h1">Reports</div>${state.reports.map(r=>`<div class="card" style="box-shadow:none"><div class="row"><b>${esc(r.report_type)}</b><span class="pill warn">${esc(r.status)}</span></div><p class="small">${esc(r.details)}</p><button class="btn green" data-report-resolve="${r.id}">Resolve</button></div>`).join('') || '<div class="empty">No reports.</div>'}</div>`; }
 
 function bindEvents(){
+  bindLocationDropdowns();
   const searchForm=$('#searchForm');
-  if(searchForm) searchForm.onsubmit=(e)=>{e.preventDefault(); const f=Object.fromEntries(new FormData(e.target)); state.filters.from=f.from||''; state.filters.to=f.to||''; state.filters.time=f.time||'any'; state.filters.rule=f.rule||'safe'; render();};
+  if(searchForm) searchForm.onsubmit=async(e)=>{e.preventDefault(); const f=Object.fromEntries(new FormData(e.target)); await performRideSearch(document.getElementById('fFrom')?.value||'', document.getElementById('fTo')?.value||'', f.time||'any', f.rule||'safe'); render();};
   const saveRouteBtn=$('#saveRouteBtn'); if(saveRouteBtn) saveRouteBtn.onclick=()=>{ const f=$('#fFrom')?.value || state.filters.from; const t=$('#fTo')?.value || state.filters.to; state.filters.from=f; state.filters.to=t; saveRoute(); };
   const templateSelect=$('#templateSelect'); if(templateSelect) templateSelect.onchange=applyTemplate;
   const rideForm=$('#rideForm'); if(rideForm) rideForm.onsubmit=createRide;
@@ -345,6 +502,7 @@ function bindEvents(){
   document.querySelectorAll('[data-active]').forEach(b=>b.onclick=()=>rpc('start_booking_trip',{p_booking_id:b.dataset.active}));
   document.querySelectorAll('[data-start-ride-all]').forEach(b=>b.onclick=()=>startRideAll(b.dataset.startRideAll));
   document.querySelectorAll('[data-share-driver-location]').forEach(b=>b.onclick=()=>shareDriverLocationForRide(b.dataset.shareDriverLocation));
+  document.querySelectorAll('[data-end-ride-all]').forEach(b=>b.onclick=()=>endRideAll(b.dataset.endRideAll));
   const markNotificationsRead=$('#markNotificationsRead'); if(markNotificationsRead) markNotificationsRead.onclick=markNotificationsReadFn;
   document.querySelectorAll('[data-contact]').forEach(b=>b.onclick=()=>getContact(b.dataset.contact));
   document.querySelectorAll('[data-doc-approve]').forEach(b=>b.onclick=()=>adminDoc(b.dataset.docApprove,'approved'));
@@ -353,7 +511,7 @@ function bindEvents(){
   document.querySelectorAll('[data-driver-unverify]').forEach(b=>b.onclick=()=>adminUnverify(b.dataset.driverUnverify));
   document.querySelectorAll('[data-open-kyc-user]').forEach(b=>b.onclick=()=>{state.selectedKycUser=b.dataset.openKycUser; render();});
   const backKycUsers=$('#backKycUsers'); if(backKycUsers) backKycUsers.onclick=()=>{state.selectedKycUser=null; render();};
-  const kycSearch=$('#kycSearch'); if(kycSearch) kycSearch.oninput=(e)=>{state.adminKycSearch=e.target.value; render();};
+  const kycSearch=$('#kycSearch'); if(kycSearch) kycSearch.oninput=debounce((e)=>{state.adminKycSearch=e.target.value; render();}, 300);
   document.querySelectorAll('[data-user-status]').forEach(b=>b.onclick=()=>{const [id,status]=b.dataset.userStatus.split(':'); rpc('admin_set_user_status',{p_user_id:id,p_status:status});});
   document.querySelectorAll('[data-report-resolve]').forEach(b=>b.onclick=()=>supabase.from('reports').update({status:'resolved'}).eq('id',b.dataset.reportResolve).then(()=>loadData().then(render)));
   document.querySelectorAll('[data-rate]').forEach(b=>b.onclick=()=>openRatingModal(b.dataset.rate));
@@ -361,14 +519,36 @@ function bindEvents(){
   const close=$('#modalClose'); if(close) close.onclick=()=>{state.modal=null; render();};
   const ratingForm=$('#ratingForm'); if(ratingForm) ratingForm.onsubmit=submitRating;
   const shareLoc=$('#shareLocationBtn'); if(shareLoc) shareLoc.onclick=shareLocation;
-  const family=$('#familyShareBtn'); if(family) family.onclick=()=>navigator.clipboard?.writeText('My RideMate trip is active. Please check my live location in RideMate.').then(()=>toast('Family message copied'));
+  const family=$('#familyShareBtn'); if(family) family.onclick=()=>{const active=state.myBookings.find(b=>['accepted','active'].includes(b.status))||state.requests.find(b=>['accepted','active'].includes(b.status)); const loc=active && (latestLocationForBooking(active.id, active.driver_id)||latestLocationForBooking(active.id, state.session.user.id)); navigator.clipboard?.writeText(shareLocationMessage(active, loc)).then(()=>toast('Family message copied'));};
+  const copyMaps=$('#copyMapsLinkBtn'); if(copyMaps) copyMaps.onclick=()=>{const active=state.myBookings.find(b=>['accepted','active'].includes(b.status))||state.requests.find(b=>['accepted','active'].includes(b.status)); const loc=active && (latestLocationForBooking(active.id, active.driver_id)||latestLocationForBooking(active.id, state.session.user.id)); if(loc) navigator.clipboard?.writeText(googleMapsUrl(loc.lat, loc.lng)).then(()=>toast('Google Maps link copied'));};
   const sos=$('#sosBtn'); if(sos) sos.onclick=()=>location.href='tel:15';
 }
-async function rpc(fn,args){ const {error}=await supabase.rpc(fn,args); if(error) toast(error.message); else {toast('Updated'); await loadData(); render();} }
+async function rpc(fn,args){
+  if(state.loading) return;
+  state.loading=true;
+  try {
+    const {error}=await supabase.rpc(fn,args);
+    if(error) toast(error.message);
+    else {toast('Updated'); await loadData(); render();}
+  } finally {
+    state.loading=false;
+  }
+}
+
 function applyTemplate(e){ const r=ROUTE_TEMPLATES[+e.target.value]; if(!r) return; const f=$('#rideForm'); f.from_city.value=r.from; f.to_city.value=r.to; f.pickup_area.value=r.from; f.dropoff_area.value=r.to; f.via_route.value=r.via; }
 async function saveRoute(){ const from=state.filters.from.trim(), to=state.filters.to.trim(); if(!from||!to) return toast('From and To required'); const {error}=await supabase.from('saved_routes').insert({user_id:state.session.user.id,from_city:from,to_city:to,notify_enabled:true}); if(error) toast(error.message); else toast('Custom route saved'); }
 async function createRide(e){
   e.preventDefault(); const f=Object.fromEntries(new FormData(e.target));
+  f.from_city = document.getElementById('rFrom')?.value || f.from_city;
+  f.to_city = document.getElementById('rTo')?.value || f.to_city;
+  f.pickup_area = document.getElementById('rPickup')?.value || f.pickup_area;
+  f.dropoff_area = document.getElementById('rDropoff')?.value || f.dropoff_area;
+  f.recurrence_type = f.recurrence_type || 'once';
+  f.recurrence_days = f.recurrence_days || '';
+  f.allow_monthly_booking = f.allow_monthly_booking || 'false';
+  f.monthly_price = f.monthly_price || '';
+  f.trip_type = f.trip_type || 'one_way';
+  if(!f.from_city || !f.to_city || !f.pickup_area || !f.dropoff_area) return toast('From, To, Pickup and Dropoff are required');
   if(new Date(f.departure_at)<=new Date()) return toast('Departure time must be in future');
   if(f.recurrence_type==='custom' && !f.recurrence_days.trim()) return toast('Custom days required');
   if(f.allow_monthly_booking==='true' && !f.monthly_price) return toast('Monthly price required');
@@ -379,6 +559,27 @@ function openBookingModal(id){ const r=state.rides.find(x=>x.id===id)||state.myR
 async function submitBooking(e){ e.preventDefault(); const f=Object.fromEntries(new FormData(e.target)); const note=[f.requested_pickup?`Requested pickup: ${f.requested_pickup}`:'', f.note||''].filter(Boolean).join(' | ') || null; const {error}=await supabase.rpc('create_booking_request_v2',{p_ride_id:f.ride_id,p_seats_requested:1,p_note:note}); if(error) toast(error.message); else {state.modal=null; toast('Request sent'); await loadData(); render();} }
 async function saveProfile(e){ e.preventDefault(); const f=Object.fromEntries(new FormData(e.target)); const [a,b]=await Promise.all([supabase.from('profiles').update({full_name:f.full_name,gender:f.gender,travel_mode:f.travel_mode}).eq('id',state.session.user.id),supabase.from('private_profiles').update({phone:f.phone,emergency_contact:f.emergency_contact||null}).eq('user_id',state.session.user.id)]); if(a.error||b.error) toast(a.error?.message||b.error?.message); else {toast('Profile saved'); await loadMe(); render();} }
 async function addVehicle(e){ e.preventDefault(); const f=Object.fromEntries(new FormData(e.target)); const {error}=await supabase.from('vehicles').insert({owner_id:state.session.user.id,car_model:f.car_model,plate_number:f.plate_number,color:f.color||null}); if(error) toast(error.message); else {toast('Vehicle added'); await loadData(); render();} }
+function compressImage(file, maxWidth=1400, quality=0.72){
+  return new Promise((resolve) => {
+    if(!file.type.startsWith('image/')) return resolve(file);
+    const img = new Image();
+    img.onload = () => {
+      const scale = Math.min(1, maxWidth / img.width);
+      const canvas = document.createElement('canvas');
+      canvas.width = Math.round(img.width * scale);
+      canvas.height = Math.round(img.height * scale);
+      const ctx = canvas.getContext('2d');
+      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+      canvas.toBlob(blob => {
+        if(!blob) return resolve(file);
+        resolve(new File([blob], file.name.replace(/\.[^.]+$/, '.jpg'), {type:'image/jpeg'}));
+      }, 'image/jpeg', quality);
+    };
+    img.onerror = () => resolve(file);
+    img.src = URL.createObjectURL(file);
+  });
+}
+
 async function submitDoc(e){
   e.preventDefault();
   const form = e.target;
@@ -386,10 +587,11 @@ async function submitDoc(e){
   const file = form.querySelector('input[name="file"]')?.files?.[0];
   if(!file) return toast('Please select an image');
   if(!file.type.startsWith('image/')) return toast('Only image files are allowed');
-  if(file.size > 5 * 1024 * 1024) return toast('Image must be less than 5MB');
-  const ext = file.name.split('.').pop() || 'jpg';
-  const path = `${state.session.user.id}/${f.doc_type}-${Date.now()}.${ext}`;
-  const up = await supabase.storage.from('kyc-documents').upload(path, file, { upsert: true, contentType: file.type });
+  if(file.size > 8 * 1024 * 1024) return toast('Image must be less than 8MB');
+  const finalFile = await compressImage(file);
+  if(finalFile.size > 3 * 1024 * 1024) return toast('Compressed image is still too large. Please use a clearer smaller image.');
+  const path = `${state.session.user.id}/${f.doc_type}-${Date.now()}.jpg`;
+  const up = await supabase.storage.from('kyc-documents').upload(path, finalFile, { upsert: true, contentType: finalFile.type });
   if(up.error) return toast(up.error.message);
   const { data } = supabase.storage.from('kyc-documents').getPublicUrl(path);
   const {error}=await supabase.from('driver_documents').insert({user_id:state.session.user.id,doc_type:f.doc_type,file_url:data.publicUrl,status:'pending'});
@@ -423,7 +625,7 @@ async function shareDriverLocationForRide(rideId){
       accuracy:pos.coords.accuracy
     }));
     const {error}=await supabase.from('trip_locations').insert(rows);
-    if(error) toast(error.message); else {toast('Driver live location shared with accepted passengers'); await loadData(); render();}
+    if(error) toast(error.message); else {toast('Live location shared with accepted passengers'); await loadData(); render();}
   },()=>toast('Location permission denied'),{enableHighAccuracy:true,timeout:10000});
 }
 
@@ -432,6 +634,16 @@ async function markNotificationsReadFn(){
   if(!unreadIds.length) return;
   const {error}=await supabase.from('notifications').update({is_read:true}).in('id', unreadIds);
   if(error) toast(error.message); else {await loadData(); render();}
+}
+
+async function endRideAll(rideId){
+  if(!confirm('End this ride for all active/accepted passengers?')) return;
+  const {error}=await supabase.rpc('end_ride_for_passengers',{p_ride_id:rideId});
+  if(error) return toast(error.message);
+  toast('Ride completed and moved to history');
+  await loadData();
+  state.tab='history';
+  render();
 }
 
 async function shareLocation(){
@@ -455,12 +667,14 @@ async function shareLocation(){
 
 function showRideDetails(id){ const r=state.rides.find(x=>x.id===id)||state.myRides.find(x=>x.id===id); state.modal=`<div class="modalBack"><div class="modal"><button class="btn ghost" id="modalClose">Close</button><div class="h1">${esc(r.from_city)} → ${esc(r.to_city)}</div><p class="muted">${fmt(r.departure_at)}</p><div class="card" style="box-shadow:none"><div class="row"><span>Pickup</span><b>${esc(r.pickup_area)}</b></div><div class="row"><span>Dropoff</span><b>${esc(r.dropoff_area)}</b></div><div class="row"><span>Via</span><b>${esc(r.via_route||'')}</b></div><div class="row"><span>Seats</span><b>${r.seats_left}/${r.total_seats}</b></div><div class="row"><span>Fare</span><b>${money(r.price_per_seat)}</b></div><div class="row"><span>Driver</span><b>${esc(r.driver_name)} · ${esc(r.driver_gender)}</b></div></div>${role()==='passenger'?`<button class="btn green" data-book="${r.id}">Request seat</button>`:''}</div></div>`; render(); }
 
-if('serviceWorker' in navigator) window.addEventListener('load',async()=>{
+if('serviceWorker' in navigator) window.addEventListener('load', async () => {
   try {
     const regs = await navigator.serviceWorker.getRegistrations();
     for (const r of regs) await r.unregister();
-    if(window.caches){ const keys=await caches.keys(); await Promise.all(keys.map(k=>caches.delete(k))); }
-    console.log('Old RideMate service workers cleared');
-  } catch(e) { console.warn(e); }
+    if (window.caches) {
+      const keys = await caches.keys();
+      await Promise.all(keys.map(k => caches.delete(k)));
+    }
+  } catch(e) {}
 });
 init();

@@ -524,3 +524,64 @@ begin
   insert into public.notifications(user_id,title,body)
   values(v.passenger_id,'Ride started','Your driver has started the ride and is coming for pickup. Open Live tab to see location.');
 end $$;
+
+
+-- Ride completion and performance indexes
+create index if not exists idx_rides_status_departure on public.rides(status, departure_at);
+create index if not exists idx_rides_driver_departure on public.rides(driver_id, departure_at desc);
+create index if not exists idx_bookings_passenger_created on public.bookings(passenger_id, created_at desc);
+create index if not exists idx_bookings_ride_status on public.bookings(ride_id, status);
+create index if not exists idx_trip_locations_booking_created on public.trip_locations(booking_id, created_at desc);
+create index if not exists idx_notifications_user_created on public.notifications(user_id, created_at desc);
+create index if not exists idx_driver_docs_user_created on public.driver_documents(user_id, created_at desc);
+
+create or replace function public.end_ride_for_passengers(p_ride_id uuid)
+returns void language plpgsql security definer set search_path=public as $$
+declare r record;
+begin
+  select * into r from public.rides where id=p_ride_id;
+  if not found then raise exception 'Ride not found'; end if;
+  if r.driver_id <> auth.uid() and not public.is_admin() then raise exception 'Not allowed'; end if;
+
+  insert into public.trip_history(ride_id, booking_id, driver_id, passenger_id, from_city, to_city, pickup_area, dropoff_area, price_per_seat, status, reason)
+  select r.id, b.id, r.driver_id, b.passenger_id, r.from_city, r.to_city, r.pickup_area, r.dropoff_area, r.price_per_seat, 'completed', 'Ride completed by driver'
+  from public.bookings b
+  where b.ride_id=p_ride_id and b.status in ('accepted','active')
+  on conflict do nothing;
+
+  update public.bookings set status='completed'
+  where ride_id=p_ride_id and status in ('accepted','active');
+
+  update public.rides set status='completed'
+  where id=p_ride_id;
+
+  insert into public.notifications(user_id,title,body)
+  select b.passenger_id, 'Ride completed', 'Your ride has been completed. You can now rate your driver from Trip history.'
+  from public.bookings b
+  where b.ride_id=p_ride_id and b.status='completed';
+end $$;
+
+
+-- Final production performance hardening
+create index if not exists idx_profiles_role_status on public.profiles(role, status);
+create index if not exists idx_profiles_verification on public.profiles(role, verification_status);
+create index if not exists idx_vehicles_owner_created on public.vehicles(owner_id, created_at desc);
+create index if not exists idx_driver_docs_status_created on public.driver_documents(status, created_at desc);
+create index if not exists idx_trip_history_passenger_created on public.trip_history(passenger_id, created_at desc);
+create index if not exists idx_trip_history_driver_created on public.trip_history(driver_id, created_at desc);
+create unique index if not exists uniq_trip_history_booking_completed on public.trip_history(booking_id)
+where booking_id is not null and status = 'completed';
+
+-- Faster ride search RPC for passenger screen.
+create or replace function public.search_rides_v2(p_from text default null, p_to text default null, p_limit int default 100)
+returns setof public.rides_public
+language sql stable security definer set search_path=public as $$
+  select *
+  from public.rides_public
+  where status='open'
+    and departure_at > now()
+    and (p_from is null or p_from='' or lower(coalesce(from_city,'') || ' ' || coalesce(pickup_area,'') || ' ' || coalesce(via_route,'')) like '%' || lower(p_from) || '%')
+    and (p_to is null or p_to='' or lower(coalesce(to_city,'') || ' ' || coalesce(dropoff_area,'') || ' ' || coalesce(via_route,'')) like '%' || lower(p_to) || '%')
+  order by departure_at asc
+  limit least(greatest(coalesce(p_limit,100),1),100);
+$$;

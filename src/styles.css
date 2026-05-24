@@ -41,3 +41,60 @@ input[type=file]{padding:12px;background:#f8fafc}
 .passengerLine{padding:10px 0;border-bottom:1px solid var(--line)}
 .passengerLine:last-child{border-bottom:0}
 .noticeCard{border-color:#b9f8d8}
+
+.mapLabel{position:absolute;left:16px;bottom:16px;background:rgba(255,255,255,.92);border:1px solid var(--line);border-radius:16px;padding:10px 12px;font-size:12px;color:var(--ink);box-shadow:var(--shadow)}
+.liveMapBox{min-height:240px}
+.btn:disabled{opacity:.45;filter:grayscale(.3)}
+
+.locBox{position:relative}
+.locDropdown{display:none;position:absolute;left:0;right:0;top:calc(100% + 6px);background:#fff;border:1px solid var(--line);border-radius:18px;box-shadow:0 18px 45px rgba(15,23,42,.16);z-index:50;max-height:260px;overflow:auto;padding:6px}
+.locDropdown.open{display:block}
+.locOption{display:block;width:100%;text-align:left;border:0;background:#fff;padding:12px 14px;border-radius:14px;color:var(--ink);font-weight:750}
+.locOption:hover,.locOption:focus{background:#ecfdf5;outline:none}
+.locEmpty{padding:12px 14px;color:var(--muted);font-size:13px}
+
+/* Native mobile app polish */
+body{overscroll-behavior:none}
+.mobileShell{max-width:460px;background:#f4f7fb}
+.statusCap{height:env(safe-area-inset-top, 10px);min-height:10px;background:#061727}
+.appHeader{
+  position:fixed;top:0;left:50%;transform:translateX(-50%);
+  width:min(460px,100%);z-index:100;
+  padding:calc(env(safe-area-inset-top, 10px) + 8px) 16px 12px;
+  background:rgba(244,247,251,.96);backdrop-filter:blur(22px);
+  border-bottom:1px solid rgba(219,230,238,.95);
+  display:flex;align-items:center;justify-content:space-between;gap:12px;
+}
+.appContent{padding-top:94px;padding-bottom:110px}
+.headerAction{border:0;background:#fff;border-radius:16px;padding:11px 13px;box-shadow:var(--soft);font-weight:1000;color:var(--ink)}
+.appTabs{
+  position:fixed;left:50%;transform:translateX(-50%);
+  width:min(460px,100%);bottom:0;z-index:100;
+  padding:8px 10px calc(10px + env(safe-area-inset-bottom));
+  background:rgba(255,255,255,.97);backdrop-filter:blur(24px);
+  border-top:1px solid var(--line);
+  box-shadow:0 -14px 35px rgba(6,23,39,.10);
+}
+.appTabs .tab{min-height:58px;border-radius:18px}
+.appTabs .tab.active{background:#dffbea;color:#087a5f}
+.appTabs .tabText{font-size:10px}
+.screenTitle{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin:4px 0 14px}
+.screenTitle .h1{margin:0;font-size:31px}
+.screenTitle p{margin:6px 0 0}
+.card{border-radius:28px}
+.nativePanel{border-radius:30px}
+.nativeMapCard{background:#fff;border:1px solid var(--line);border-radius:30px;padding:14px;box-shadow:var(--soft);margin-bottom:14px}
+.mapPreview{height:250px;border-radius:24px;background:linear-gradient(135deg,#d7e4ec,#f8fbfd);position:relative;overflow:hidden;border:1px solid var(--line)}
+.mapPreview:before{content:"";position:absolute;inset:0;background:radial-gradient(circle at 20% 20%,rgba(19,184,138,.16),transparent 20%),radial-gradient(circle at 80% 70%,rgba(50,168,255,.18),transparent 24%)}
+.routeLine{position:absolute;left:36px;right:36px;top:126px;height:12px;background:#13b88a;border-radius:999px;transform:rotate(-18deg);box-shadow:0 0 0 6px rgba(19,184,138,.12)}
+.movingPin{position:absolute;left:50%;top:43%;transform:translate(-50%,-50%);width:54px;height:54px;border-radius:22px;background:#fff;display:grid;place-items:center;font-size:29px;box-shadow:0 14px 34px rgba(6,23,39,.20)}
+.mapInfo{position:absolute;left:14px;right:14px;bottom:14px;background:rgba(255,255,255,.94);border:1px solid var(--line);border-radius:18px;padding:12px;font-size:12px;color:var(--ink);box-shadow:var(--soft)}
+.mapBlank{min-height:180px;border-radius:24px;background:#f8fafc;border:1px dashed #cbd5e1;display:flex;align-items:center;gap:12px;padding:18px;color:var(--muted)}
+.mapPin{width:54px;height:54px;border-radius:20px;background:#fff;display:grid;place-items:center;font-size:26px;box-shadow:var(--soft)}
+.mapBtn{text-decoration:none;text-align:center;display:block}
+@media(min-width:800px){
+  .appHeader{top:24px;border-radius:38px 38px 0 0}
+  .appTabs{bottom:24px;border-radius:0 0 38px 38px}
+}
+
+.headerActions{display:flex;align-items:center;gap:8px}.headerActions .headerAction:first-child{width:42px;padding:11px 0}

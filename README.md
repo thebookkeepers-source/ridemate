@@ -41,3 +41,17 @@ See `docs/ANDROID-BUILD-STEPS.md`.
 - Admin can approve driver when at least 3 documents are approved.
 - Passenger search typing is fixed; fields no longer reset while typing.
 - Service worker/cache cleanup added to reduce second-launch white screen.
+
+
+## Map/location production note
+
+The app uses browser/mobile Geolocation for live driver location. No paid API is required for saving and sharing coordinates.
+For an actual visual moving map at scale, add a proper tile provider such as MapTiler/Mapbox/Google Maps. Do not rely on public OpenStreetMap tiles for high-volume commercial production traffic.
+
+
+## Google Maps link mode
+Live location uses browser Geolocation and stores coordinates in Supabase. The app generates Google Maps links from the latest coordinates, so no Google Maps API key is required for link opening. A full in-app moving map later needs a map provider/API key.
+
+
+## Final production audit
+See `docs/FINAL-PRODUCTION-AUDIT.md` for the final QA and performance summary.
